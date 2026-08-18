@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_RAW_BUFFER_TRANSPORT_DELEGATE_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_RAW_BUFFER_TRANSPORT_DELEGATE_H_
+#ifndef TPU_SYNC_TRANSPORT_LIB_RAW_BUFFER_TRANSPORT_DELEGATE_H_
+#define TPU_SYNC_TRANSPORT_LIB_RAW_BUFFER_TRANSPORT_DELEGATE_H_
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "grpcpp/channel.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -48,8 +51,15 @@ class RawBufferTransportDelegate {
   virtual absl::Status OnDataReceived(uint64_t uuid = 0) {
     return absl::OkStatus();
   }
+
+  // Returns the gRPC channel for PeregrineControlService for the given peer.
+  // Required when kRequirePspTcp is true.
+  virtual std::shared_ptr<grpc::Channel> GetPeregrineChannel(
+      absl::string_view peer) {
+    return nullptr;
+  }
 };
 
 }  // namespace tpu_raiden::transport::lib
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_RAW_BUFFER_TRANSPORT_DELEGATE_H_
+#endif  // TPU_SYNC_TRANSPORT_LIB_RAW_BUFFER_TRANSPORT_DELEGATE_H_

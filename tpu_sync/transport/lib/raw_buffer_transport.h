@@ -30,6 +30,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -37,6 +38,7 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
+#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -77,6 +79,23 @@ class RawBufferTransport final {
   // Return the connection pool that manages the sockets that connect to peers.
   ConnPool& conn_pool() { return conn_pool_; }
 
+  // Borrows a connection from the pool, resolving gRPC channel for PSP.
+  absl::StatusOr<int> BorrowConnection(absl::string_view peer,
+                                       absl::string_view local_ip = "") {
+    std::shared_ptr<grpc::Channel> channel = nullptr;
+    if constexpr (lib::kRequirePspTcp) {
+      if (raw_delegate_) {
+        channel = raw_delegate_->GetPeregrineChannel(peer);
+      }
+    }
+    return conn_pool_.Borrow(peer, local_ip, channel);
+  }
+
+  void ReturnConnection(bool ok_to_pool, int fd, absl::string_view peer,
+                        absl::string_view local_ip = "") {
+    conn_pool_.Return(ok_to_pool, fd, peer, local_ip);
+  }
+
   // Synchronously pulls a buffer identified by `buffer_id` from the remote
   // `peer`, by sending out a `kOpBufferPull ChunkHeader` and then receiving
   // the data from the peer.
@@ -112,6 +131,11 @@ class RawBufferTransport final {
 
   // Drops receive-progress counters belonging to the give `uuid`.
   void ForgetPushProgress(uint64_t uuid);
+
+  // Registers incoming client PSP key and returns server's allocated RX key.
+  // Triggered by ExchangePspKey() in PeregrineControlServiceImpl.
+  absl::StatusOr<PspPeerKey> RegisterPspPeer(uint32_t client_spi,
+                                             absl::string_view client_key);
 
  private:
   // Pushes a batch of buffers to the remote `peer`, by sending out a
@@ -149,13 +173,16 @@ class RawBufferTransport final {
   absl::Mutex mu_;
   absl::flat_hash_set<int> active_client_fds_ ABSL_GUARDED_BY(mu_);
 
-  // The conn_pool_ owns the sockets that connect to peers. in comparison, the
+  // The conn_pool_ owns the sockets that connect to peers. In comparison, the
   // active_client_fds above are those sockets accepted from peers.
   ConnPool conn_pool_;
 
   absl::Mutex raw_progress_mu_;
   absl::flat_hash_map<uint64_t, RawProgress> raw_progress_
       ABSL_GUARDED_BY(raw_progress_mu_);
+
+  // To protect multiple gRPC threads can call RegisterPspPeer concurrently
+  absl::Mutex psp_mu_;
 
   std::thread listener_thread_;
   std::vector<std::thread> worker_threads_;

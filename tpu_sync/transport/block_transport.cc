@@ -53,6 +53,7 @@
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
+#include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
@@ -200,7 +201,9 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
           [this](int client_fd, const lib::ChunkHeader& header) {
             return HandleCustomRequest(client_fd, header);
           },
-          absl::GetFlag(FLAGS_raiden_transport_coalesce_window_bytes)) {
+          absl::GetFlag(FLAGS_raiden_transport_coalesce_window_bytes)),
+      peregrine_control_(
+          std::make_unique<lib::PeregrineControlServiceImpl>(&raw_transport_)) {
   socket_workers_.reserve(parallelism_);
   for (int i = 0; i < parallelism_; ++i) {
     socket_workers_.push_back(
@@ -901,7 +904,7 @@ void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
     return;
   }
 
-  auto status_or_fd = raw_transport_.conn_pool().Borrow(peer, local_ip);
+  auto status_or_fd = raw_transport_.BorrowConnection(peer, local_ip);
   if (!status_or_fd.ok()) {
     statuses[stream_idx] = status_or_fd.status();
     return;
@@ -910,7 +913,7 @@ void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
   const int fd = status_or_fd.value();
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup([&] {
-    raw_transport_.conn_pool().Return(ok_to_pool, fd, peer, local_ip);
+    raw_transport_.ReturnConnection(ok_to_pool, fd, peer, local_ip);
   });
 
   lib::ChunkHeader header = {};
@@ -1042,7 +1045,7 @@ void BlockTransport::H2hReadWorker(
     const std::vector<uint8_t*>& explicit_dst_ptrs,
     std::vector<absl::Status>& statuses, MajorOrder major_order,
     BlockReceivedCallback on_block_received, uint64_t uuid) {
-  auto status_or_fd = raw_transport_.conn_pool().Borrow(peer, local_ip);
+  auto status_or_fd = raw_transport_.BorrowConnection(peer, local_ip);
   if (!status_or_fd.ok()) {
     statuses[stream_idx] = status_or_fd.status();
     return;
@@ -1051,7 +1054,7 @@ void BlockTransport::H2hReadWorker(
   const int fd = status_or_fd.value();
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup([&] {
-    raw_transport_.conn_pool().Return(ok_to_pool, fd, peer, local_ip);
+    raw_transport_.ReturnConnection(ok_to_pool, fd, peer, local_ip);
   });
 
   size_t SF = block_delegate_->shard_factor();

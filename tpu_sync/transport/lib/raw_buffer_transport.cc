@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>  // NOLINT
@@ -51,11 +52,13 @@
 #ifndef IOV_MAX
 #define IOV_MAX 1024
 #endif
+#include "grpcpp/channel.h"
 #include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
+#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden::transport::lib {
@@ -419,6 +422,21 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
   close(client_fd);
 }
 
+absl::StatusOr<PspPeerKey>
+RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
+                                    absl::string_view client_key) {
+  if constexpr (!kRequirePspTcp) {
+    return absl::FailedPreconditionError("PSP-TCP is disabled.");
+  }
+  absl::MutexLock lock(psp_mu_);
+  if (stopping_ || server_fd_ < 0) {
+    return absl::FailedPreconditionError(
+        "Transport is stopping or listening socket is not initialized.");
+  }
+
+  return RegisterPspPeerKey(server_fd_, client_spi, client_key);
+}
+
 void RawBufferTransport::ListenerLoop() {
   while (!stopping_) {
     DCHECK(IsValidSocket(server_fd_));
@@ -437,6 +455,12 @@ void RawBufferTransport::ListenerLoop() {
         server_fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
     if (client_fd < 0) {
       if (stopping_) break;
+      continue;
+    }
+    if (kRequirePspTcp && !PspEnabled(client_fd)) {
+      close(client_fd);
+      LOG_EVERY_N_SEC(ERROR, 1)
+          << "Unencrypted TCP connection rejected on PSP listener";
       continue;
     }
 
@@ -476,7 +500,11 @@ absl::Status RawBufferTransport::PullBuffer(
         ", Size: ", size_bytes, ", Shard Host Size: ", host_size));
   }
 
-  ASSIGN_OR_RETURN(const int fd, conn_pool_.Borrow(peer));
+  std::shared_ptr<grpc::Channel> channel = nullptr;
+  if (raw_delegate_ != nullptr) {
+    channel = raw_delegate_->GetPeregrineChannel(peer);
+  }
+  ASSIGN_OR_RETURN(const int fd, conn_pool_.Borrow(peer, "", channel));
   bool ok_to_pool = false;
   auto fd_cleaner =
       absl::MakeCleanup([&] { conn_pool_.Return(ok_to_pool, fd, peer); });
@@ -568,7 +596,11 @@ absl::Status RawBufferTransport::PushBuffer(absl::string_view peer,
         "Destination peer address cannot be empty");
   }
 
-  ASSIGN_OR_RETURN(const int fd, conn_pool_.Borrow(peer));
+  std::shared_ptr<grpc::Channel> channel = nullptr;
+  if (raw_delegate_ != nullptr) {
+    channel = raw_delegate_->GetPeregrineChannel(peer);
+  }
+  ASSIGN_OR_RETURN(const int fd, conn_pool_.Borrow(peer, "", channel));
   bool ok_to_pool = false;
   auto fd_cleaner =
       absl::MakeCleanup([&] { conn_pool_.Return(ok_to_pool, fd, peer); });
@@ -717,7 +749,11 @@ absl::Status RawBufferTransport::PushBatch(
         "Destination peer address cannot be empty");
   }
 
-  ASSIGN_OR_RETURN(const int fd, conn_pool_.Borrow(peer));
+  std::shared_ptr<grpc::Channel> channel = nullptr;
+  if (raw_delegate_ != nullptr) {
+    channel = raw_delegate_->GetPeregrineChannel(peer);
+  }
+  ASSIGN_OR_RETURN(const int fd, conn_pool_.Borrow(peer, "", channel));
   bool ok_to_pool = false;
   auto fd_cleaner =
       absl::MakeCleanup([&] { conn_pool_.Return(ok_to_pool, fd, peer); });
