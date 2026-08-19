@@ -254,6 +254,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::string req_id;
     uint64_t uuid = 0;
     int64_t slot_idx = -1;
+    // Host blocks held under demand staging, released on completion. Empty
+    // when the transfer holds a fixed slot instead.
+    std::vector<int> staged_host_blocks;
     int64_t num_blocks = 0;
     int64_t registered_num_blocks = 0;
     int64_t total_bytes = 0;

@@ -1968,12 +1968,21 @@ void KVCacheManagerWithTransfer::ReleaseSlotLocked(int64_t slot_idx) {
 
 void KVCacheManagerWithTransfer::ReleaseEntrySlotLocked(
     const std::shared_ptr<SendEntry>& entry) {
-  if (!entry || entry->slot_idx < 0 || entry->slot_released) return;
-  RemoveStagingReadinessLocked(entry->slot_idx);
+  if (!entry || entry->slot_released) return;
+  if (entry->slot_idx < 0 && entry->staged_host_blocks.empty()) return;
+  if (entry->slot_idx >= 0) {
+    RemoveStagingReadinessLocked(entry->slot_idx);
+  }
   for (int64_t block_id : entry->registered_block_ids) {
     active_producer_blocks_.erase(block_id);
   }
-  ReleaseSlotLocked(entry->slot_idx);
+  if (!entry->staged_host_blocks.empty()) {
+    (void)host_block_manager_->Unlock(entry->staged_host_blocks);
+    (void)host_block_manager_->Deallocate(entry->staged_host_blocks);
+    entry->staged_host_blocks.clear();
+  } else {
+    ReleaseSlotLocked(entry->slot_idx);
+  }
   entry->slot_released = true;
 }
 
@@ -2320,28 +2329,54 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   // those host blocks to the consumer, keeping host offsets within the staging
   // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
   // once a device block id exceeds num_host_blocks.
-  int64_t send_slot = -1;
   std::vector<int64_t> host_block_ids;
-  {
-    absl::MutexLock lock(mu_);
-    if (static_cast<int64_t>(src_block_ids.size()) > max_blocks_ ||
-        free_slots_.empty()) {
+  const auto stage_deadline = DeadlineFromNow();
+  while (true) {
+    {
+      absl::MutexLock lock(mu_);
+      auto it = send_entries_.find(uuid);
+      if (it == send_entries_.end()) {
+        return;  // request cancelled while waiting for staging
+      }
+      if (!dynamic_host_staging_ &&
+          static_cast<int64_t>(src_block_ids.size()) > max_blocks_) {
+        // A fixed slot can never seat this request; report the send as
+        // failed so the consumer aborts now rather than timing out.
+        LOG(ERROR) << "StartPushInternal: request " << it->second->req_id
+                   << " needs " << src_block_ids.size()
+                   << " blocks but a staging slot holds " << max_blocks_;
+        failed_recving_.insert(it->second->req_id);
+        ReleaseEntrySlotLocked(it->second);
+        send_entries_.erase(it);
+        return;
+      }
+      RecvEntry staging;
+      auto staged = AcquireRecvStagingLocked(
+          static_cast<int64_t>(src_block_ids.size()), &staging);
+      if (staged.has_value()) {
+        it->second->slot_idx = staging.slot_idx;
+        it->second->staged_host_blocks = std::move(staging.staged_host_blocks);
+        host_block_ids = std::move(*staged);
+        break;
+      }
+    }
+    // Staging exhausted: wait for in-flight sends to hand blocks back
+    // instead of reporting a send that never happened. The consumer's own
+    // deadline still bounds the total wait.
+    if (std::chrono::steady_clock::now() >= stage_deadline) {
+      absl::MutexLock lock(mu_);
       auto it = send_entries_.find(uuid);
       if (it != send_entries_.end()) {
-        done_sending_.insert(it->second->req_id);
+        LOG(ERROR) << "StartPushInternal: staging exhausted serving "
+                   << it->second->req_id << " (" << src_block_ids.size()
+                   << " blocks); reporting transfer failure";
+        failed_recving_.insert(it->second->req_id);
         ReleaseEntrySlotLocked(it->second);
         send_entries_.erase(it);
       }
       return;
     }
-    Slot slot = AcquireSlotLocked();
-    send_slot = slot.slot_idx;
-    auto it = send_entries_.find(uuid);
-    if (it != send_entries_.end()) it->second->slot_idx = send_slot;
-    host_block_ids.reserve(src_block_ids.size());
-    for (size_t k = 0; k < src_block_ids.size(); ++k) {
-      host_block_ids.push_back(slot.block_ids[k]);
-    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
   // Coalesce contiguous (device,host) block runs into a few large copies. With
